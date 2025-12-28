@@ -1,0 +1,335 @@
+// Montunos WL Bot - Render Web Service friendly
+// - Mantiene comandos: /wlpass /wldenied /wdpass /wddenied
+// - Mantiene logs y mensajes (incluye GIFs de /assets)
+// - Más robusto: validación de env, de-dup de interacciones y manejo de errores
+
+require("dotenv").config();
+
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+
+const http = require("http");
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  WebhookClient
+} = require("discord.js");
+
+// ================== ENV ==================
+const env = {
+  TOKEN: process.env.DISCORD_TOKEN,
+  GUILD_ID: process.env.GUILD_ID,
+
+  ROLE_WHITELIST: process.env.ROLE_WHITELIST_ID,
+  ROLE_DENIED: process.env.ROLE_DENIED_ID,
+
+  ROLE_WD_WHITELIST: process.env.ROLE_WD_WHITELIST_ID,
+  ROLE_WD_DENIED: process.env.ROLE_WD_DENIED_ID,
+
+  PUBLIC_CHANNEL: process.env.PUBLIC_CHANNEL_ID,
+  LOG_CHANNEL: process.env.LOG_CHANNEL_ID,
+  WD_LOG_CHANNEL: process.env.WD_LOG_CHANNEL_ID,
+
+  WD_WEBHOOK_URL: process.env.WD_WEBHOOK_URL,
+
+  PORT: Number(process.env.PORT || 10000)
+};
+
+function requireEnv(keys) {
+  const missing = keys.filter((k) => !env[k]);
+  if (missing.length) {
+    console.error("❌ FALTAN VARIABLES DE ENTORNO:", missing.join(", "));
+    console.error("Revisa tu configuración en Render -> Environment.");
+    process.exit(1);
+  }
+}
+
+// Para que el bot haga lo que prometiste, estas son obligatorias:
+requireEnv([
+  "TOKEN",
+  "GUILD_ID",
+  "ROLE_WHITELIST",
+  "ROLE_DENIED",
+  "ROLE_WD_WHITELIST",
+  "ROLE_WD_DENIED",
+  "PUBLIC_CHANNEL",
+  "LOG_CHANNEL",
+  "WD_LOG_CHANNEL"
+]);
+
+const wdWebhook = env.WD_WEBHOOK_URL ? new WebhookClient({ url: env.WD_WEBHOOK_URL }) : null;
+
+// ================== KEEP-ALIVE HTTP ==================
+http
+  .createServer((req, res) => {
+    // endpoint sencillo para UptimeRobot
+    if (req.url === "/health" || req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  })
+  .listen(env.PORT, () => {
+    console.log(`Servidor HTTP keep-alive activo en puerto ${env.PORT}`);
+  });
+
+// ================== DISCORD CLIENT ==================
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
+});
+
+// De-dup simple para evitar dobles ejecuciones cuando el host se pone raro (deploy/zero-downtime)
+const recentInteractionIds = new Map(); // id -> timestamp
+function seenInteraction(id) {
+  const now = Date.now();
+  // Limpieza
+  for (const [k, ts] of recentInteractionIds) {
+    if (now - ts > 5 * 60 * 1000) recentInteractionIds.delete(k);
+  }
+  if (recentInteractionIds.has(id)) return true;
+  recentInteractionIds.set(id, now);
+  return false;
+}
+
+// ================== COMMANDS ==================
+function buildCommands() {
+  const idOpt = (b) =>
+    b.addStringOption((option) =>
+      option
+        .setName("id")
+        .setDescription("ID del usuario")
+        .setRequired(true)
+    );
+
+  return [
+    idOpt(new SlashCommandBuilder().setName("wlpass").setDescription("Aprobar whitelist de un usuario")),
+    idOpt(new SlashCommandBuilder().setName("wldenied").setDescription("Denegar whitelist de un usuario")),
+    idOpt(new SlashCommandBuilder().setName("wdpass").setDescription("Aprobar whitelist DELICTIVA (WD)")),
+    idOpt(new SlashCommandBuilder().setName("wddenied").setDescription("Denegar whitelist DELICTIVA (WD)"))
+  ].map((c) => c.toJSON());
+}
+
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(env.TOKEN);
+
+  console.log("Intentando registrar comandos en GUILD:", env.GUILD_ID);
+  const commands = buildCommands();
+
+  // Ojo: guild commands se reflejan casi inmediato (global tarda más)
+  await rest.put(Routes.applicationGuildCommands(client.user.id, env.GUILD_ID), { body: commands });
+  console.log("✔️ Comandos registrados correctamente");
+}
+
+// ================== HELPERS ==================
+function isValidDiscordId(s) {
+  return typeof s === "string" && /^[0-9]{17,20}$/.test(s.trim());
+}
+
+async function safeFetchChannel(guild, channelId) {
+  try {
+    return await guild.channels.fetch(channelId);
+  } catch {
+    return null;
+  }
+}
+
+async function safeFetchMember(guild, userId) {
+  try {
+    return await guild.members.fetch(userId);
+  } catch {
+    return null;
+  }
+}
+
+async function safeSend(channel, payload) {
+  try {
+    await channel.send(payload);
+  } catch (e) {
+    console.error("Error enviando mensaje a canal:", e);
+  }
+}
+
+async function safeAddRole(member, roleId) {
+  await member.roles.add(roleId);
+}
+
+// ================== READY ==================
+client.once("ready", async () => {
+  console.log("=========== EVENTO READY ===========");
+  console.log(`Bot iniciado como ${client.user.tag}`);
+  console.log(`Guild configurada: ${env.GUILD_ID}`);
+
+  try {
+    await registerCommands();
+  } catch (e) {
+    console.error("❌ Error registrando comandos:", e);
+  }
+
+  console.log("=========== READY COMPLETADO ===========");
+});
+
+// ================== LÓGICA DE COMANDOS ==================
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (!interaction.isChatInputCommand()) return;
+    if (seenInteraction(interaction.id)) return;
+
+    const cmd = interaction.commandName;
+
+    // 🔒 Solo permitir el comando en su canal de LOGS correspondiente
+    const expectedLogChannel =
+      cmd === "wdpass" || cmd === "wddenied" ? env.WD_LOG_CHANNEL : env.LOG_CHANNEL;
+
+    if (expectedLogChannel && interaction.channelId !== expectedLogChannel) {
+      await interaction.reply({
+        content: "❌ Este comando solo se puede usar en el canal de logs configurado.",
+        ephemeral: true
+      });
+      return;
+    }
+
+    const guild = interaction.guild || (await client.guilds.fetch(env.GUILD_ID));
+    const userId = (interaction.options.getString("id") || "").trim();
+
+    await interaction.deferReply({ ephemeral: true });
+
+    if (!isValidDiscordId(userId)) {
+      await interaction.editReply("❌ Ese ID no parece válido (debe ser solo números).");
+      return;
+    }
+
+    const member = await safeFetchMember(guild, userId);
+    if (!member) {
+      await interaction.editReply("❌ No encontré ese usuario en el servidor.");
+      return;
+    }
+
+    // ========= WL APROBADA =========
+    if (cmd === "wlpass") {
+      await safeAddRole(member, env.ROLE_WHITELIST);
+
+      const logChannel = await safeFetchChannel(guild, env.LOG_CHANNEL);
+      if (logChannel) {
+        await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó una WL → <@${userId}>`);
+      }
+
+      const publicChannel = await safeFetchChannel(guild, env.PUBLIC_CHANNEL);
+      if (publicChannel) {
+        await safeSend(publicChannel, {
+          content:
+            ` ᴡʜɪᴛᴇʟɪsᴛ ᴀᴘʀᴏʙᴀᴅᴀ <@${userId}> — ` +
+            `**ᴀsɪ́ sɪ́, Bienvenido Montuno. ғᴏʀᴍᴜʟᴀʀɪᴏ ʟɪᴍᴘɪᴏ. ᴀᴅᴇʟᴀɴᴛᴇ.**`,
+          files: ["./assets/wlpass.gif"]
+        });
+      }
+
+      await interaction.editReply("✔️ WL aprobada.");
+      return;
+    }
+
+    // ========= WL DENEGADA =========
+    if (cmd === "wldenied") {
+      await safeAddRole(member, env.ROLE_DENIED);
+
+      const logChannel = await safeFetchChannel(guild, env.LOG_CHANNEL);
+      if (logChannel) {
+        await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó una WL → <@${userId}>`);
+      }
+
+      const publicChannel = await safeFetchChannel(guild, env.PUBLIC_CHANNEL);
+      if (publicChannel) {
+        await safeSend(publicChannel, {
+          content:
+            ` ᴡʜɪᴛᴇʟɪsᴛ ᴅᴇɴᴇɢᴀᴅᴀ <@${userId}> — ` +
+            `**ʀᴇᴠɪsᴇ ʟᴀs ɴᴏʀᴍᴀs ᴀɴᴛᴇs ᴅᴇ ᴠᴏʟᴠᴇʀ.**`,
+          files: ["./assets/wldenied.gif"]
+        });
+      }
+
+      await interaction.editReply("❌ Denegado.");
+      return;
+    }
+
+    // ========= WD WL APROBADA =========
+    if (cmd === "wdpass") {
+      await safeAddRole(member, env.ROLE_WD_WHITELIST);
+
+      const logChannel = await safeFetchChannel(guild, env.WD_LOG_CHANNEL);
+      if (logChannel) {
+        await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó **WL Delictiva** → <@${userId}>`);
+      }
+
+      if (wdWebhook) {
+        wdWebhook
+          .send({
+            content:
+              `✅ **ʜᴀ sɪᴅᴏ ᴀᴘʀᴏʙᴀᴅᴏ ᴘᴀʀᴀ ᴇʟ ʀᴏʟ ᴅᴇʟ...** <@${userId}> — ` +
+              `**ᴇʟ ʀᴏʟ ʜᴀʙʟᴀʀᴀ ᴘᴏʀ ᴠᴏs, ɴᴏ ʟᴏs ᴅɪsᴘᴀʀᴏs.**`,
+            files: [{ attachment: "./assets/wdpass.gif", name: "wdpass.gif" }]
+          })
+          .catch(console.error);
+      } else {
+        console.log("WD_WEBHOOK_URL no configurado, no se envió anuncio WD.");
+      }
+
+      await interaction.editReply("✔️ WL Delictiva aprobada.");
+      return;
+    }
+
+    // ========= WD WL DENEGADA =========
+    if (cmd === "wddenied") {
+      await safeAddRole(member, env.ROLE_WD_DENIED);
+
+      const logChannel = await safeFetchChannel(guild, env.WD_LOG_CHANNEL);
+      if (logChannel) {
+        await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó **WL Delictiva** → <@${userId}>`);
+      }
+
+      if (wdWebhook) {
+        wdWebhook
+          .send({
+            content:
+              `❌ **ᴀᴘʟɪᴄᴀᴄɪᴏ́ɴ ᴅᴇʟɪᴄᴛɪᴠᴀ ᴅᴇɴᴇɢᴀᴅᴀ** <@${userId}> — ` +
+              `**ᴘᴜᴇᴅᴇs ᴠᴏʟᴠᴇʀ ᴀ ɪɴᴛᴇɴᴛᴀʀʟᴏ ᴍᴀ́s ᴀᴅᴇʟᴀɴᴛᴇ.**`,
+            files: [{ attachment: "./assets/wddenied.gif", name: "wddenied.gif" }]
+          })
+          .catch(console.error);
+      } else {
+        console.log("WD_WEBHOOK_URL no configurado, no se envió anuncio WD.");
+      }
+
+      await interaction.editReply("❌ WL Delictiva denegada.");
+      return;
+    }
+
+    await interaction.editReply("❌ Comando no reconocido.");
+  } catch (err) {
+    console.error("Error general en interactionCreate:", err);
+
+    try {
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content: "❌ Ocurrió un error al procesar el comando.",
+          ephemeral: true
+        });
+      } else if (interaction.deferred) {
+        await interaction.editReply("❌ Ocurrió un error al procesar el comando.");
+      }
+    } catch (e) {
+      console.error("Error al enviar mensaje de error:", e);
+    }
+  }
+});
+
+// ================== LOGIN ==================
+console.log("Iniciando login… TOKEN presente?", !!env.TOKEN);
+
+client
+  .login(env.TOKEN)
+  .then(() => console.log("✅ Login correcto, esperando evento 'ready'..."))
+  .catch((err) => console.error("❌ Error en client.login:", err));
