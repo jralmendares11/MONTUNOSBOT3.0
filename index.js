@@ -326,10 +326,19 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+client.on("error", (e) => console.error("DISCORD CLIENT ERROR:", e));
+client.on("shardError", (e) => console.error("DISCORD SHARD ERROR:", e));
+client.on("warn", (m) => console.warn("DISCORD WARN:", m));
+
+process.on("unhandledRejection", (r) => console.error("UNHANDLED REJECTION:", r));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
+
+client.once("ready", () => console.log("✅ READY:", client.user.tag));
+
 // ================== LOGIN ==================
 console.log("Iniciando login… TOKEN presente?", !!env.TOKEN);
 
 client
   .login(env.TOKEN)
   .then(() => console.log("✅ Login correcto, esperando evento 'ready'..."))
-  .catch((err) => console.error("❌ Error en client.login:", err));
+  .catch((e) => console.error("❌ Error en client.login:", e));
