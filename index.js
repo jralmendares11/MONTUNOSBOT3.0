@@ -1,13 +1,6 @@
-console.log("=== BOOT ===", new Date().toISOString());
-console.log("NODE:", process.version);
-console.log("DEBUG ENV:", process.env.DEBUG);
-console.log("GUILD_ID:", process.env.GUILD_ID);
-console.log("TOKEN length:", (process.env.DISCORD_TOKEN || "").length);
+"use strict";
 
 require("dotenv").config();
-
-process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
 
 const http = require("http");
 const {
@@ -18,6 +11,17 @@ const {
   SlashCommandBuilder,
   WebhookClient
 } = require("discord.js");
+
+// ================== BOOT LOGS ==================
+console.log("=== BOOT ===", new Date().toISOString());
+console.log("NODE:", process.version);
+console.log("DEBUG ENV:", process.env.DEBUG);
+console.log("GUILD_ID:", process.env.GUILD_ID);
+console.log("TOKEN length:", (process.env.DISCORD_TOKEN || "").length);
+
+// ================== SAFETY LOGGING ==================
+process.on("unhandledRejection", (e) => console.error("❌ UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("❌ UNCAUGHT EXCEPTION:", e));
 
 // ================== ENV ==================
 const env = {
@@ -43,12 +47,12 @@ function requireEnv(keys) {
   const missing = keys.filter((k) => !env[k]);
   if (missing.length) {
     console.error("❌ FALTAN VARIABLES DE ENTORNO:", missing.join(", "));
-    console.error("Revisa tu configuración en Render -> Environment.");
+    console.error("Revisa Render -> Environment y vuelve a desplegar.");
     process.exit(1);
   }
 }
 
-// Para que el bot haga lo que prometiste, estas son obligatorias:
+// Obligatorias para que TODO funcione como prometiste:
 requireEnv([
   "TOKEN",
   "GUILD_ID",
@@ -66,7 +70,6 @@ const wdWebhook = env.WD_WEBHOOK_URL ? new WebhookClient({ url: env.WD_WEBHOOK_U
 // ================== KEEP-ALIVE HTTP ==================
 http
   .createServer((req, res) => {
-    // endpoint sencillo para UptimeRobot
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end("ok");
@@ -84,27 +87,23 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
-// De-dup simple para evitar dobles ejecuciones cuando el host se pone raro (deploy/zero-downtime)
-const recentInteractionIds = new Map(); // id -> timestamp
-function seenInteraction(id) {
-  const now = Date.now();
-  // Limpieza
-  for (const [k, ts] of recentInteractionIds) {
-    if (now - ts > 5 * 60 * 1000) recentInteractionIds.delete(k);
+client.on("error", (e) => console.error("❌ DISCORD CLIENT ERROR:", e));
+client.on("shardError", (e) => console.error("❌ DISCORD SHARD ERROR:", e));
+client.on("warn", (m) => console.warn("⚠️ DISCORD WARN:", m));
+
+// ================== READY WATCHDOG ==================
+let readyFired = false;
+setTimeout(() => {
+  if (!readyFired) {
+    console.error("⏳ TIMEOUT: Pasaron 25s y el bot NO llegó a READY. Revisa token/gateway/permiso.");
   }
-  if (recentInteractionIds.has(id)) return true;
-  recentInteractionIds.set(id, now);
-  return false;
-}
+}, 25000);
 
 // ================== COMMANDS ==================
 function buildCommands() {
   const idOpt = (b) =>
     b.addStringOption((option) =>
-      option
-        .setName("id")
-        .setDescription("ID del usuario")
-        .setRequired(true)
+      option.setName("id").setDescription("ID del usuario").setRequired(true)
     );
 
   return [
@@ -121,8 +120,11 @@ async function registerCommands() {
   console.log("Intentando registrar comandos en GUILD:", env.GUILD_ID);
   const commands = buildCommands();
 
-  // Ojo: guild commands se reflejan casi inmediato (global tarda más)
-  await rest.put(Routes.applicationGuildCommands(client.user.id, env.GUILD_ID), { body: commands });
+  // Guild commands = casi inmediato
+  await rest.put(Routes.applicationGuildCommands(client.user.id, env.GUILD_ID), {
+    body: commands
+  });
+
   console.log("✔️ Comandos registrados correctamente");
 }
 
@@ -156,13 +158,32 @@ async function safeSend(channel, payload) {
 }
 
 async function safeAddRole(member, roleId) {
-  await member.roles.add(roleId);
+  try {
+    await member.roles.add(roleId);
+  } catch (e) {
+    console.error("Error agregando rol:", roleId, "->", e);
+    throw e;
+  }
+}
+
+// ================== DE-DUP ==================
+const recentInteractionIds = new Map(); // id -> timestamp
+function seenInteraction(id) {
+  const now = Date.now();
+  for (const [k, ts] of recentInteractionIds) {
+    if (now - ts > 5 * 60 * 1000) recentInteractionIds.delete(k);
+  }
+  if (recentInteractionIds.has(id)) return true;
+  recentInteractionIds.set(id, now);
+  return false;
 }
 
 // ================== READY ==================
 client.once("ready", async () => {
+  readyFired = true;
+
   console.log("=========== EVENTO READY ===========");
-  console.log(`Bot iniciado como ${client.user.tag}`);
+  console.log(`✅ Bot iniciado como ${client.user.tag}`);
   console.log(`Guild configurada: ${env.GUILD_ID}`);
 
   try {
@@ -215,9 +236,7 @@ client.on("interactionCreate", async (interaction) => {
       await safeAddRole(member, env.ROLE_WHITELIST);
 
       const logChannel = await safeFetchChannel(guild, env.LOG_CHANNEL);
-      if (logChannel) {
-        await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó una WL → <@${userId}>`);
-      }
+      if (logChannel) await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó una WL → <@${userId}>`);
 
       const publicChannel = await safeFetchChannel(guild, env.PUBLIC_CHANNEL);
       if (publicChannel) {
@@ -238,9 +257,7 @@ client.on("interactionCreate", async (interaction) => {
       await safeAddRole(member, env.ROLE_DENIED);
 
       const logChannel = await safeFetchChannel(guild, env.LOG_CHANNEL);
-      if (logChannel) {
-        await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó una WL → <@${userId}>`);
-      }
+      if (logChannel) await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó una WL → <@${userId}>`);
 
       const publicChannel = await safeFetchChannel(guild, env.PUBLIC_CHANNEL);
       if (publicChannel) {
@@ -261,9 +278,7 @@ client.on("interactionCreate", async (interaction) => {
       await safeAddRole(member, env.ROLE_WD_WHITELIST);
 
       const logChannel = await safeFetchChannel(guild, env.WD_LOG_CHANNEL);
-      if (logChannel) {
-        await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó **WL Delictiva** → <@${userId}>`);
-      }
+      if (logChannel) await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó **WL Delictiva** → <@${userId}>`);
 
       if (wdWebhook) {
         wdWebhook
@@ -287,9 +302,7 @@ client.on("interactionCreate", async (interaction) => {
       await safeAddRole(member, env.ROLE_WD_DENIED);
 
       const logChannel = await safeFetchChannel(guild, env.WD_LOG_CHANNEL);
-      if (logChannel) {
-        await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó **WL Delictiva** → <@${userId}>`);
-      }
+      if (logChannel) await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó **WL Delictiva** → <@${userId}>`);
 
       if (wdWebhook) {
         wdWebhook
@@ -327,19 +340,10 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-client.on("error", (e) => console.error("DISCORD CLIENT ERROR:", e));
-client.on("shardError", (e) => console.error("DISCORD SHARD ERROR:", e));
-client.on("warn", (m) => console.warn("DISCORD WARN:", m));
-
-process.on("unhandledRejection", (r) => console.error("UNHANDLED REJECTION:", r));
-process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
-
-client.once("ready", () => console.log("✅ READY:", client.user.tag));
-
 // ================== LOGIN ==================
 console.log("Iniciando login… TOKEN presente?", !!env.TOKEN);
 
 client
   .login(env.TOKEN)
-  .then(() => console.log("✅ Login correcto, esperando evento 'ready'..."))
-  .catch((e) => console.error("❌ Error en client.login:", e));
+  .then(() => console.log("✅ login() resolved (esperando READY)"))
+  .catch((e) => console.error("❌ login() failed:", e));
