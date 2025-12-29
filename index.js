@@ -1,7 +1,8 @@
-// Montunos WL Bot - Render Web Service friendly
-// - Mantiene comandos: /wlpass /wldenied /wdpass /wddenied
-// - Mantiene logs y mensajes (incluye GIFs de /assets)
-// - Más robusto: validación de env, de-dup de interacciones y manejo de errores
+console.log("=== BOOT ===", new Date().toISOString());
+console.log("NODE:", process.version);
+console.log("DEBUG ENV:", process.env.DEBUG);
+console.log("GUILD_ID:", process.env.GUILD_ID);
+console.log("TOKEN length:", (process.env.DISCORD_TOKEN || "").length);
 
 require("dotenv").config();
 
