@@ -341,9 +341,13 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ================== LOGIN ==================
-console.log("Iniciando login… TOKEN presente?", !!env.TOKEN);
+(async () => {
+  await tokenPreflight();
 
-client
-  .login(env.TOKEN)
-  .then(() => console.log("✅ login() resolved (esperando READY)"))
-  .catch((e) => console.error("❌ login() failed:", e));
+  console.log("Iniciando login… TOKEN presente?", !!env.TOKEN);
+
+  client
+    .login(env.TOKEN)
+    .then(() => console.log("✅ login() resolved (token aceptado)"))
+    .catch((e) => console.error("❌ login() failed:", e));
+})();
