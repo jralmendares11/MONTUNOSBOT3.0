@@ -40,7 +40,7 @@ const env = {
 
   WD_WEBHOOK_URL: process.env.WD_WEBHOOK_URL,
 
-  // ✅ SOLO ESTE ROL PUEDE USAR LOS COMANDOS
+  // ✅ SOLO ESTE ROL PUEDE USAR LOS COMANDOS (EN CUALQUIER CANAL)
   ALLOWED_ROLE: process.env.ALLOWED_ROLE_ID,
 
   PORT: Number(process.env.PORT || 10000)
@@ -50,7 +50,7 @@ function requireEnv(keys) {
   const missing = keys.filter((k) => !env[k]);
   if (missing.length) {
     console.error("❌ FALTAN VARIABLES DE ENTORNO:", missing.join(", "));
-    console.error("Revisa Render/Railway -> Variables y vuelve a desplegar.");
+    console.error("Revisa Railway/Render -> Variables y vuelve a desplegar.");
     process.exit(1);
   }
 }
@@ -201,9 +201,21 @@ client.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (seenInteraction(interaction.id)) return;
 
-    // ✅ PERMISO SOLO POR ROL
+    // 🔥 LOG PARA QUE SÍ SALGA EN RAILWAY
+    console.log(
+      "➡️ CMD:",
+      interaction.commandName,
+      "| by:",
+      interaction.user?.tag,
+      `(${interaction.user?.id})`,
+      "| channel:",
+      interaction.channelId
+    );
+
+    // ✅ PERMISO SOLO POR ROL (NO IMPORTA EL CANAL)
     const member = interaction.member; // GuildMember
     if (!member?.roles?.cache?.has(env.ALLOWED_ROLE)) {
+      console.log("⛔ Sin permiso (rol). user:", interaction.user?.id);
       await interaction.reply({
         content: "❌ No tienes permisos para usar este comando.",
         ephemeral: true
@@ -246,6 +258,7 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      console.log("✅ wlpass aplicado a:", userId);
       await interaction.editReply("✔️ WL aprobada.");
       return;
     }
@@ -267,6 +280,7 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      console.log("✅ wldenied aplicado a:", userId);
       await interaction.editReply("❌ Denegado.");
       return;
     }
@@ -289,6 +303,7 @@ client.on("interactionCreate", async (interaction) => {
           .catch(console.error);
       }
 
+      console.log("✅ wdpass aplicado a:", userId);
       await interaction.editReply("✔️ WL Delictiva aprobada.");
       return;
     }
@@ -311,6 +326,7 @@ client.on("interactionCreate", async (interaction) => {
           .catch(console.error);
       }
 
+      console.log("✅ wddenied aplicado a:", userId);
       await interaction.editReply("❌ WL Delictiva denegada.");
       return;
     }
