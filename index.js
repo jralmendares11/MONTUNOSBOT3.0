@@ -3,6 +3,7 @@
 require("dotenv").config();
 
 const http = require("http");
+const { request } = require("undici");
 const {
   Client,
   GatewayIntentBits,
@@ -47,12 +48,10 @@ function requireEnv(keys) {
   const missing = keys.filter((k) => !env[k]);
   if (missing.length) {
     console.error("❌ FALTAN VARIABLES DE ENTORNO:", missing.join(", "));
-    console.error("Revisa Render -> Environment y vuelve a desplegar.");
     process.exit(1);
   }
 }
 
-// Obligatorias para que TODO funcione como prometiste:
 requireEnv([
   "TOKEN",
   "GUILD_ID",
@@ -65,7 +64,9 @@ requireEnv([
   "WD_LOG_CHANNEL"
 ]);
 
-const wdWebhook = env.WD_WEBHOOK_URL ? new WebhookClient({ url: env.WD_WEBHOOK_URL }) : null;
+const wdWebhook = env.WD_WEBHOOK_URL
+  ? new WebhookClient({ url: env.WD_WEBHOOK_URL })
+  : null;
 
 // ================== KEEP-ALIVE HTTP ==================
 http
@@ -95,9 +96,27 @@ client.on("warn", (m) => console.warn("⚠️ DISCORD WARN:", m));
 let readyFired = false;
 setTimeout(() => {
   if (!readyFired) {
-    console.error("⏳ TIMEOUT: Pasaron 25s y el bot NO llegó a READY. Revisa token/gateway/permiso.");
+    console.error("⏳ TIMEOUT: Pasaron 25s y el bot NO llegó a READY.");
   }
 }, 25000);
+
+// ================== TOKEN PREFLIGHT ==================
+async function tokenPreflight() {
+  try {
+    const res = await request("https://discord.com/api/v10/users/@me", {
+      method: "GET",
+      headers: {
+        Authorization: `Bot ${env.TOKEN}`
+      }
+    });
+
+    const body = await res.body.text();
+    console.log("✅ PRECHECK /users/@me status:", res.statusCode);
+    console.log("✅ PRECHECK body:", body.slice(0, 200));
+  } catch (e) {
+    console.error("❌ PRECHECK fallo (HTTP a Discord):", e);
+  }
+}
 
 // ================== COMMANDS ==================
 function buildCommands() {
@@ -107,237 +126,28 @@ function buildCommands() {
     );
 
   return [
-    idOpt(new SlashCommandBuilder().setName("wlpass").setDescription("Aprobar whitelist de un usuario")),
-    idOpt(new SlashCommandBuilder().setName("wldenied").setDescription("Denegar whitelist de un usuario")),
-    idOpt(new SlashCommandBuilder().setName("wdpass").setDescription("Aprobar whitelist DELICTIVA (WD)")),
-    idOpt(new SlashCommandBuilder().setName("wddenied").setDescription("Denegar whitelist DELICTIVA (WD)"))
+    idOpt(new SlashCommandBuilder().setName("wlpass").setDescription("Aprobar whitelist")),
+    idOpt(new SlashCommandBuilder().setName("wldenied").setDescription("Denegar whitelist")),
+    idOpt(new SlashCommandBuilder().setName("wdpass").setDescription("Aprobar WL Delictiva")),
+    idOpt(new SlashCommandBuilder().setName("wddenied").setDescription("Denegar WL Delictiva"))
   ].map((c) => c.toJSON());
 }
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(env.TOKEN);
-
-  console.log("Intentando registrar comandos en GUILD:", env.GUILD_ID);
-  const commands = buildCommands();
-
-  // Guild commands = casi inmediato
-  await rest.put(Routes.applicationGuildCommands(client.user.id, env.GUILD_ID), {
-    body: commands
-  });
-
+  await rest.put(
+    Routes.applicationGuildCommands(client.user.id, env.GUILD_ID),
+    { body: buildCommands() }
+  );
   console.log("✔️ Comandos registrados correctamente");
-}
-
-// ================== HELPERS ==================
-function isValidDiscordId(s) {
-  return typeof s === "string" && /^[0-9]{17,20}$/.test(s.trim());
-}
-
-async function safeFetchChannel(guild, channelId) {
-  try {
-    return await guild.channels.fetch(channelId);
-  } catch {
-    return null;
-  }
-}
-
-async function safeFetchMember(guild, userId) {
-  try {
-    return await guild.members.fetch(userId);
-  } catch {
-    return null;
-  }
-}
-
-async function safeSend(channel, payload) {
-  try {
-    await channel.send(payload);
-  } catch (e) {
-    console.error("Error enviando mensaje a canal:", e);
-  }
-}
-
-async function safeAddRole(member, roleId) {
-  try {
-    await member.roles.add(roleId);
-  } catch (e) {
-    console.error("Error agregando rol:", roleId, "->", e);
-    throw e;
-  }
-}
-
-// ================== DE-DUP ==================
-const recentInteractionIds = new Map(); // id -> timestamp
-function seenInteraction(id) {
-  const now = Date.now();
-  for (const [k, ts] of recentInteractionIds) {
-    if (now - ts > 5 * 60 * 1000) recentInteractionIds.delete(k);
-  }
-  if (recentInteractionIds.has(id)) return true;
-  recentInteractionIds.set(id, now);
-  return false;
 }
 
 // ================== READY ==================
 client.once("ready", async () => {
   readyFired = true;
-
-  console.log("=========== EVENTO READY ===========");
-  console.log(`✅ Bot iniciado como ${client.user.tag}`);
-  console.log(`Guild configurada: ${env.GUILD_ID}`);
-
-  try {
-    await registerCommands();
-  } catch (e) {
-    console.error("❌ Error registrando comandos:", e);
-  }
-
-  console.log("=========== READY COMPLETADO ===========");
-});
-
-// ================== LÓGICA DE COMANDOS ==================
-client.on("interactionCreate", async (interaction) => {
-  try {
-    if (!interaction.isChatInputCommand()) return;
-    if (seenInteraction(interaction.id)) return;
-
-    const cmd = interaction.commandName;
-
-    // 🔒 Solo permitir el comando en su canal de LOGS correspondiente
-    const expectedLogChannel =
-      cmd === "wdpass" || cmd === "wddenied" ? env.WD_LOG_CHANNEL : env.LOG_CHANNEL;
-
-    if (expectedLogChannel && interaction.channelId !== expectedLogChannel) {
-      await interaction.reply({
-        content: "❌ Este comando solo se puede usar en el canal de logs configurado.",
-        ephemeral: true
-      });
-      return;
-    }
-
-    const guild = interaction.guild || (await client.guilds.fetch(env.GUILD_ID));
-    const userId = (interaction.options.getString("id") || "").trim();
-
-    await interaction.deferReply({ ephemeral: true });
-
-    if (!isValidDiscordId(userId)) {
-      await interaction.editReply("❌ Ese ID no parece válido (debe ser solo números).");
-      return;
-    }
-
-    const member = await safeFetchMember(guild, userId);
-    if (!member) {
-      await interaction.editReply("❌ No encontré ese usuario en el servidor.");
-      return;
-    }
-
-    // ========= WL APROBADA =========
-    if (cmd === "wlpass") {
-      await safeAddRole(member, env.ROLE_WHITELIST);
-
-      const logChannel = await safeFetchChannel(guild, env.LOG_CHANNEL);
-      if (logChannel) await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó una WL → <@${userId}>`);
-
-      const publicChannel = await safeFetchChannel(guild, env.PUBLIC_CHANNEL);
-      if (publicChannel) {
-        await safeSend(publicChannel, {
-          content:
-            ` ᴡʜɪᴛᴇʟɪsᴛ ᴀᴘʀᴏʙᴀᴅᴀ <@${userId}> — ` +
-            `**ᴀsɪ́ sɪ́, Bienvenido Montuno. ғᴏʀᴍᴜʟᴀʀɪᴏ ʟɪᴍᴘɪᴏ. ᴀᴅᴇʟᴀɴᴛᴇ.**`,
-          files: ["./assets/wlpass.gif"]
-        });
-      }
-
-      await interaction.editReply("✔️ WL aprobada.");
-      return;
-    }
-
-    // ========= WL DENEGADA =========
-    if (cmd === "wldenied") {
-      await safeAddRole(member, env.ROLE_DENIED);
-
-      const logChannel = await safeFetchChannel(guild, env.LOG_CHANNEL);
-      if (logChannel) await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó una WL → <@${userId}>`);
-
-      const publicChannel = await safeFetchChannel(guild, env.PUBLIC_CHANNEL);
-      if (publicChannel) {
-        await safeSend(publicChannel, {
-          content:
-            ` ᴡʜɪᴛᴇʟɪsᴛ ᴅᴇɴᴇɢᴀᴅᴀ <@${userId}> — ` +
-            `**ʀᴇᴠɪsᴇ ʟᴀs ɴᴏʀᴍᴀs ᴀɴᴛᴇs ᴅᴇ ᴠᴏʟᴠᴇʀ.**`,
-          files: ["./assets/wldenied.gif"]
-        });
-      }
-
-      await interaction.editReply("❌ Denegado.");
-      return;
-    }
-
-    // ========= WD WL APROBADA =========
-    if (cmd === "wdpass") {
-      await safeAddRole(member, env.ROLE_WD_WHITELIST);
-
-      const logChannel = await safeFetchChannel(guild, env.WD_LOG_CHANNEL);
-      if (logChannel) await safeSend(logChannel, `🟢 <@${interaction.user.id}> aprobó **WL Delictiva** → <@${userId}>`);
-
-      if (wdWebhook) {
-        wdWebhook
-          .send({
-            content:
-              `✅ **ʜᴀ sɪᴅᴏ ᴀᴘʀᴏʙᴀᴅᴏ ᴘᴀʀᴀ ᴇʟ ʀᴏʟ ᴅᴇʟ...** <@${userId}> — ` +
-              `**ᴇʟ ʀᴏʟ ʜᴀʙʟᴀʀᴀ ᴘᴏʀ ᴠᴏs, ɴᴏ ʟᴏs ᴅɪsᴘᴀʀᴏs.**`,
-            files: [{ attachment: "./assets/wdpass.gif", name: "wdpass.gif" }]
-          })
-          .catch(console.error);
-      } else {
-        console.log("WD_WEBHOOK_URL no configurado, no se envió anuncio WD.");
-      }
-
-      await interaction.editReply("✔️ WL Delictiva aprobada.");
-      return;
-    }
-
-    // ========= WD WL DENEGADA =========
-    if (cmd === "wddenied") {
-      await safeAddRole(member, env.ROLE_WD_DENIED);
-
-      const logChannel = await safeFetchChannel(guild, env.WD_LOG_CHANNEL);
-      if (logChannel) await safeSend(logChannel, `🔴 <@${interaction.user.id}> denegó **WL Delictiva** → <@${userId}>`);
-
-      if (wdWebhook) {
-        wdWebhook
-          .send({
-            content:
-              `❌ **ᴀᴘʟɪᴄᴀᴄɪᴏ́ɴ ᴅᴇʟɪᴄᴛɪᴠᴀ ᴅᴇɴᴇɢᴀᴅᴀ** <@${userId}> — ` +
-              `**ᴘᴜᴇᴅᴇs ᴠᴏʟᴠᴇʀ ᴀ ɪɴᴛᴇɴᴛᴀʀʟᴏ ᴍᴀ́s ᴀᴅᴇʟᴀɴᴛᴇ.**`,
-            files: [{ attachment: "./assets/wddenied.gif", name: "wddenied.gif" }]
-          })
-          .catch(console.error);
-      } else {
-        console.log("WD_WEBHOOK_URL no configurado, no se envió anuncio WD.");
-      }
-
-      await interaction.editReply("❌ WL Delictiva denegada.");
-      return;
-    }
-
-    await interaction.editReply("❌ Comando no reconocido.");
-  } catch (err) {
-    console.error("Error general en interactionCreate:", err);
-
-    try {
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({
-          content: "❌ Ocurrió un error al procesar el comando.",
-          ephemeral: true
-        });
-      } else if (interaction.deferred) {
-        await interaction.editReply("❌ Ocurrió un error al procesar el comando.");
-      }
-    } catch (e) {
-      console.error("Error al enviar mensaje de error:", e);
-    }
-  }
+  console.log("=========== READY ===========");
+  console.log(`Bot: ${client.user.tag}`);
+  await registerCommands();
 });
 
 // ================== LOGIN ==================
@@ -348,6 +158,6 @@ client.on("interactionCreate", async (interaction) => {
 
   client
     .login(env.TOKEN)
-    .then(() => console.log("✅ login() resolved (token aceptado)"))
+    .then(() => console.log("✅ login() resolved"))
     .catch((e) => console.error("❌ login() failed:", e));
 })();
